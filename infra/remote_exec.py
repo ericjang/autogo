@@ -257,6 +257,57 @@ def _periodic_pull_loop(
                 log_fp.flush()
 
 
+def _read_priorities(path: Path | str | None) -> dict[str, int]:
+    """Parse a priorities file into a `{name: priority}` dict.
+
+    Format: one job per line, ``"<int_priority> <name>"`` separated by
+    whitespace. ``#`` comments and blank lines are skipped. Lines whose first
+    token isn't an integer, or that have fewer than two tokens, are skipped
+    silently — the file is meant to be operator-edited so partial garbage
+    shouldn't kill an in-flight run.
+
+    Returns ``{}`` for ``None`` or missing paths so callers can drop the
+    feature mid-run by deleting the file.
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    out: dict[str, int] = {}
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            prio = int(parts[0])
+        except ValueError:
+            continue
+        out[parts[1]] = prio
+    return out
+
+
+def _write_priorities_stub(path: Path | str, jobs: list[Job]) -> None:
+    """Seed a priorities file with every job at priority 0.
+
+    `run_pool` writes this once at startup if a priorities_file is given and
+    the file doesn't already exist, so an operator can edit it mid-run to
+    bump specific jobs without restarting.
+    """
+    lines = [
+        "# Edit to re-prioritize pending jobs (higher = sooner). Format:",
+        "#   <int> <job_name>",
+        "# Blank lines and '#' comments are ignored. Re-read on every claim.",
+        "",
+    ]
+    for j in jobs:
+        lines.append(f"0 {j.name}")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
 def run_one(
     worker: Worker,
     image: str,
@@ -383,6 +434,7 @@ def run_pool(
     periodic_pull_interval_s: float = 300.0,
     share_cluster: bool = False,
     poll_interval_s: float = 5.0,
+    priorities_file: Path | None = None,
 ) -> dict[str, int]:
     """Round-robin dispatch `jobs` across `workers`.
 
@@ -408,6 +460,10 @@ def run_pool(
     if per_gpu:
         workers = expand_gpu_workers(workers)
     lease_mgr = LeaseManager(driver=exp_name or "") if share_cluster else None
+    if priorities_file is not None:
+        priorities_file = Path(priorities_file)
+        if not priorities_file.exists():
+            _write_priorities_stub(priorities_file, jobs)
 
     # Jobs are held in an index-addressable list rather than a Queue so each
     # worker can skip jobs whose hardware constraints it doesn't satisfy and
@@ -437,13 +493,20 @@ def run_pool(
         return True
 
     def _claim_next(w: Worker) -> tuple[int, Job] | None:
-        """Claim the next unclaimed job compatible with `w` in FIFO order. Caller holds lock."""
-        for i, j in enumerate(pending):
-            if i in claimed or not _compatible(w, j):
-                continue
-            claimed.add(i)
-            return i, j
-        return None
+        """Claim the next unclaimed compatible job. With priorities_file set,
+        higher-priority jobs win; ties broken by FIFO order. Caller holds lock."""
+        prio = _read_priorities(priorities_file)
+        candidates = [
+            (i, j) for i, j in enumerate(pending)
+            if i not in claimed and _compatible(w, j)
+        ]
+        if not candidates:
+            return None
+        # Higher priority first; ties → original index (FIFO).
+        candidates.sort(key=lambda ij: (-prio.get(ij[1].name, 0), ij[0]))
+        idx, job = candidates[0]
+        claimed.add(idx)
+        return idx, job
 
     def worker_loop(w: Worker) -> None:
         with lock:
