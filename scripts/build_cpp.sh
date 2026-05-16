@@ -12,10 +12,8 @@ else
     VENV_PYTHON="$(uv python find)"
 fi
 
-# Detect Python paths
+# Detect Python root (FindPython3 + pybind11 auto-detect the rest)
 PYTHON_ROOT=$($VENV_PYTHON -c "import sys; print(sys.base_prefix)")
-PYTHON_INCLUDE=$($VENV_PYTHON -c "import sysconfig; print(sysconfig.get_path('include'))")
-PYTHON_LIBRARY=$($VENV_PYTHON -c "import sysconfig, os; print(os.path.join(sysconfig.get_config_var('LIBDIR'), 'libpython3.10.so'))")
 
 # Build
 rm -rf "$BUILD_DIR"
@@ -25,8 +23,6 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython3_EXECUTABLE="$VENV_PYTHON" \
     -DPython3_ROOT_DIR="$PYTHON_ROOT" \
-    -DPython3_INCLUDE_DIR="$PYTHON_INCLUDE" \
-    -DPython3_LIBRARY="$PYTHON_LIBRARY" \
     -DFETCHCONTENT_BASE_DIR="/tmp/cmake-fetchcontent"
 cmake --build . -j$(nproc)
 
