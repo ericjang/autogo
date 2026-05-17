@@ -63,7 +63,9 @@ target_link_libraries(mcts PUBLIC go_game)
 pybind11_add_module(alpha_go_cpp
     bindings/bindings.cpp
 )
-target_link_libraries(alpha_go_cpp PRIVATE go_game mcts)
+# mcts PUBLIC-links go_game (above), so it propagates transitively here.
+# Listing go_game again double-links it (ld: "ignoring duplicate libraries").
+target_link_libraries(alpha_go_cpp PRIVATE mcts)
 
 # Tests (Catch2)
 FetchContent_Declare(
