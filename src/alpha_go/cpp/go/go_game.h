@@ -9,6 +9,28 @@
 
 namespace alpha_go {
 
+// Immutable, board-size-only lookup tables. These depend solely on
+// `size` and never change after construction, yet a GoBoard is copied
+// constantly (every PSK legality simulation, every MCTS node expansion,
+// every rollout step, and once per tree node by value). Storing them
+// per-instance meant every copy memcpy'd ~3.5 KB of constant data and
+// did 3 heap allocations. Sharing one cached instance per size makes a
+// GoBoard copy just copy the 81-byte board + scalars + a pointer.
+struct BoardTables {
+    // neighbor_indices[i] holds the flat indices of cell i's neighbors;
+    // neighbor_counts[i] is how many are valid (1-4, board edges/corners).
+    std::vector<std::array<int, 4>> neighbor_indices;
+    std::vector<int> neighbor_counts;
+    // zobrist[i][color] is a fixed random 64-bit value per (position,
+    // color). Deterministic per size so equal boards hash identically.
+    std::vector<std::array<uint64_t, 3>> zobrist;
+};
+
+// Returns the process-wide cached tables for a given board size,
+// building them on first use. The reference is stable for the program
+// lifetime, so GoBoard can safely hold a raw pointer into it.
+const BoardTables& board_tables(int size);
+
 // Board representation: flat array for cache efficiency
 // Values: 0=EMPTY, 1=BLACK, 2=WHITE
 class GoBoard {
@@ -63,9 +85,6 @@ public:
     void set_from_array(const int8_t* board_data, int8_t to_play);
 
 private:
-    void init_neighbors();
-    void init_zobrist();              // Fill zobrist_ with deterministic values
-
     // Flood-fill to find connected group and its liberties
     // Returns (group_indices, liberty_indices)
     std::pair<std::vector<int>, std::vector<int>> get_group_and_liberties(int index) const;
@@ -80,6 +99,18 @@ private:
     // and ALSO inserts the pre-move hash into seen_hashes_.
     void play_flat_unchecked(int index);
 
+    // Lightweight copy for the is_legal_flat PSK/suicide simulation:
+    // everything except seen_hashes_, which is_legal_flat would clear
+    // anyway. Avoids copy-constructing (then discarding) the whole
+    // seen_hashes_ set on every legality check past move 1.
+    struct SimClone {};
+    GoBoard(const GoBoard& o, SimClone)
+        : size_(o.size_), komi_(o.komi_), board_(o.board_),
+          to_play_(o.to_play_), ko_point_(o.ko_point_),
+          consecutive_passes_(o.consecutive_passes_),
+          move_count_(o.move_count_), tables_(o.tables_),
+          current_hash_(o.current_hash_) {}
+
     int size_;
     float komi_;
     std::vector<int8_t> board_;       // size_ * size_
@@ -88,22 +119,21 @@ private:
     int consecutive_passes_ = 0;
     int move_count_ = 0;
 
-    // Pre-computed neighbors (4 neighbors per cell max)
-    // neighbor_indices_[i] contains the flat indices of neighbors of cell i
-    // neighbor_counts_[i] is the number of valid neighbors (1-4)
-    std::vector<std::array<int, 4>> neighbor_indices_;
-    std::vector<int> neighbor_counts_;
+    // Shared, immutable, size-only lookup tables (neighbors + zobrist).
+    // Points into a process-wide cache (see board_tables()); never owned,
+    // never freed by GoBoard. Copying a GoBoard just copies this pointer.
+    const BoardTables* tables_;
 
     // Positional superko (PSK) state.
     //
-    // - zobrist_[color][index] is a per-(color, position) random 64-bit
-    //   value, fixed at construction (deterministic seed). The current
-    //   board hash is the XOR of zobrist_[board_[i]][i] over all
+    // - tables_->zobrist[index][color] is a per-(position, color) random
+    //   64-bit value, fixed per board size (deterministic). The current
+    //   board hash is the XOR of tables_->zobrist[i][board_[i]] over all
     //   non-empty positions (color codes 1=BLACK, 2=WHITE; we ignore
     //   slot 0).
     // - current_hash_ is incrementally maintained: every stone placement
-    //   XORs in zobrist_[player][p]; every capture XORs out
-    //   zobrist_[stone][p].
+    //   XORs in zobrist[p][player]; every capture XORs out
+    //   zobrist[p][stone].
     // - seen_hashes_ is the set of hashes for board states reached
     //   *before* the current state (positions B0, B1, ..., B_{n-1} when
     //   the current state is Bn). is_legal_flat rejects any move whose
@@ -111,7 +141,6 @@ private:
     //   A pass leaves the board unchanged so the resulting hash equals
     //   current_hash_ (which is NOT in seen_hashes_ until the NEXT move
     //   adds it), so passing is always legal under PSK as expected.
-    std::vector<std::array<uint64_t, 3>> zobrist_;
     uint64_t current_hash_ = 0;
     std::unordered_set<uint64_t> seen_hashes_;
 };

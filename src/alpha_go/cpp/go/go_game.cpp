@@ -2,33 +2,40 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <random>
 #include <unordered_set>
 
 namespace alpha_go {
 
-GoBoard::GoBoard(int size, float komi)
-    : size_(size),
-      komi_(komi),
-      board_(size * size, EMPTY),
-      neighbor_indices_(size * size),
-      neighbor_counts_(size * size),
-      zobrist_(size * size) {
-    init_neighbors();
-    init_zobrist();
-    // Empty board hash = 0 (XOR of zero stones). seen_hashes_ starts
-    // empty — the first move's resulting hash is unconditionally legal
-    // (no prior states to repeat), and the empty-board hash gets added
-    // to seen_hashes_ when the first move is played.
-}
+namespace {
 
-void GoBoard::init_zobrist() {
-    // Deterministic seed so two GoBoards with the same size hash the
-    // same board states identically. (Different seeds for different
-    // sizes since N² varies.) splitmix64 from the seed gives
-    // good-enough distributed 64-bit values for our purposes.
-    uint64_t seed = 0x9E3779B97F4A7C15ULL ^ static_cast<uint64_t>(size_);
+BoardTables build_board_tables(int size) {
+    BoardTables t;
+    const int n = size * size;
+    t.neighbor_indices.resize(n);
+    t.neighbor_counts.resize(n);
+    t.zobrist.resize(n);
+
+    for (int row = 0; row < size; ++row) {
+        for (int col = 0; col < size; ++col) {
+            int idx = row * size + col;
+            int count = 0;
+            if (row > 0)         t.neighbor_indices[idx][count++] = (row - 1) * size + col;
+            if (row < size - 1)  t.neighbor_indices[idx][count++] = (row + 1) * size + col;
+            if (col > 0)         t.neighbor_indices[idx][count++] = row * size + (col - 1);
+            if (col < size - 1)  t.neighbor_indices[idx][count++] = row * size + (col + 1);
+            t.neighbor_counts[idx] = count;
+        }
+    }
+
+    // Deterministic seed so two boards of the same size hash identically.
+    // (Different seeds per size since N² varies.) splitmix64 gives
+    // well-distributed 64-bit values.
+    uint64_t seed = 0x9E3779B97F4A7C15ULL ^ static_cast<uint64_t>(size);
     auto next = [&seed]() -> uint64_t {
         seed += 0x9E3779B97F4A7C15ULL;
         uint64_t z = seed;
@@ -36,40 +43,42 @@ void GoBoard::init_zobrist() {
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         return z ^ (z >> 31);
     };
-    const int n = size_ * size_;
     for (int i = 0; i < n; ++i) {
-        zobrist_[i][EMPTY] = 0;            // empty contributes nothing
-        zobrist_[i][BLACK] = next();
-        zobrist_[i][WHITE] = next();
+        t.zobrist[i][GoBoard::EMPTY] = 0;       // empty contributes nothing
+        t.zobrist[i][GoBoard::BLACK] = next();
+        t.zobrist[i][GoBoard::WHITE] = next();
     }
+    return t;
 }
 
-void GoBoard::init_neighbors() {
-    for (int row = 0; row < size_; ++row) {
-        for (int col = 0; col < size_; ++col) {
-            int idx = flat_index(row, col);
-            int count = 0;
+}  // namespace
 
-            // Up
-            if (row > 0) {
-                neighbor_indices_[idx][count++] = flat_index(row - 1, col);
-            }
-            // Down
-            if (row < size_ - 1) {
-                neighbor_indices_[idx][count++] = flat_index(row + 1, col);
-            }
-            // Left
-            if (col > 0) {
-                neighbor_indices_[idx][count++] = flat_index(row, col - 1);
-            }
-            // Right
-            if (col < size_ - 1) {
-                neighbor_indices_[idx][count++] = flat_index(row, col + 1);
-            }
-
-            neighbor_counts_[idx] = count;
-        }
+const BoardTables& board_tables(int size) {
+    // Built once per size, then read-only for the program lifetime.
+    // GoBoard construction is the only caller (never per-copy), so the
+    // mutex is uncontended in practice; it only guards the rare
+    // first-touch insert against the leaf-parallel batched path.
+    static std::mutex mu;
+    static std::map<int, std::unique_ptr<BoardTables>> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(size);
+    if (it == cache.end()) {
+        it = cache.emplace(size,
+                            std::make_unique<BoardTables>(build_board_tables(size)))
+                 .first;
     }
+    return *it->second;
+}
+
+GoBoard::GoBoard(int size, float komi)
+    : size_(size),
+      komi_(komi),
+      board_(size * size, EMPTY),
+      tables_(&board_tables(size)) {
+    // Empty board hash = 0 (XOR of zero stones). seen_hashes_ starts
+    // empty — the first move's resulting hash is unconditionally legal
+    // (no prior states to repeat), and the empty-board hash gets added
+    // to seen_hashes_ when the first move is played.
 }
 
 std::pair<std::vector<int>, std::vector<int>> GoBoard::get_group_and_liberties(int index) const {
@@ -92,8 +101,8 @@ std::pair<std::vector<int>, std::vector<int>> GoBoard::get_group_and_liberties(i
         queue.pop();
         group.push_back(current);
 
-        for (int i = 0; i < neighbor_counts_[current]; ++i) {
-            int neighbor = neighbor_indices_[current][i];
+        for (int i = 0; i < tables_->neighbor_counts[current]; ++i) {
+            int neighbor = tables_->neighbor_indices[current][i];
 
             if (board_[neighbor] == EMPTY) {
                 if (!liberty_visited[neighbor]) {
@@ -114,7 +123,7 @@ int GoBoard::remove_group(const std::vector<int>& group) {
     for (int idx : group) {
         // XOR-out the stone's contribution from current_hash_ before
         // erasing it. Symmetric to the placement XOR in play_flat_unchecked.
-        current_hash_ ^= zobrist_[idx][board_[idx]];
+        current_hash_ ^= tables_->zobrist[idx][board_[idx]];
         board_[idx] = EMPTY;
     }
     return static_cast<int>(group.size());
@@ -164,8 +173,8 @@ bool GoBoard::is_legal_flat(int index) const {
     bool has_friendly_neighbor = false;
     bool has_empty_neighbor = false;
     bool captures_opponent = false;
-    for (int i = 0; i < neighbor_counts_[index]; ++i) {
-        int neighbor = neighbor_indices_[index][i];
+    for (int i = 0; i < tables_->neighbor_counts[index]; ++i) {
+        int neighbor = tables_->neighbor_indices[index][i];
         int8_t v = board_[neighbor];
         if (v == EMPTY) {
             has_empty_neighbor = true;
@@ -195,10 +204,10 @@ bool GoBoard::is_legal_flat(int index) const {
     bool need_suicide_check = !has_empty_neighbor && !captures_opponent;
     bool need_psk_check = !seen_hashes_.empty();
     if (need_suicide_check || need_psk_check) {
-        GoBoard tmp(*this);
-        // Don't pay for copying seen_hashes_ on the simulation path;
-        // we only need the resulting hash + occupancy at `index`.
-        tmp.seen_hashes_.clear();
+        // Lightweight clone: skips copy-constructing (then discarding)
+        // the whole seen_hashes_ set. We only need the resulting hash +
+        // occupancy at `index`; PSK is checked against *this's history.
+        GoBoard tmp(*this, SimClone{});
         tmp.play_flat_unchecked(index);
         // (a) Multi-stone suicide: play_flat_unchecked's self-capture
         // branch removes our group when it has no liberties post-move,
@@ -252,7 +261,7 @@ void GoBoard::play_flat_unchecked(int index) {
 
     // Place the stone (and update the running hash).
     board_[index] = to_play_;
-    current_hash_ ^= zobrist_[index][to_play_];
+    current_hash_ ^= tables_->zobrist[index][to_play_];
     int8_t opponent = (to_play_ == BLACK) ? WHITE : BLACK;
 
     // Reset ko point
@@ -262,8 +271,8 @@ void GoBoard::play_flat_unchecked(int index) {
     int total_captured = 0;
     int last_captured_idx = -1;
 
-    for (int i = 0; i < neighbor_counts_[index]; ++i) {
-        int neighbor = neighbor_indices_[index][i];
+    for (int i = 0; i < tables_->neighbor_counts[index]; ++i) {
+        int neighbor = tables_->neighbor_indices[index][i];
         if (board_[neighbor] == opponent) {
             auto [group, liberties] = get_group_and_liberties(neighbor);
             if (liberties.empty()) {
@@ -353,8 +362,8 @@ float GoBoard::score() const {
             queue.pop();
             territory.push_back(current);
 
-            for (int j = 0; j < neighbor_counts_[current]; ++j) {
-                int neighbor = neighbor_indices_[current][j];
+            for (int j = 0; j < tables_->neighbor_counts[current]; ++j) {
+                int neighbor = tables_->neighbor_indices[current][j];
                 if (board_[neighbor] == EMPTY) {
                     if (!visited[neighbor]) {
                         visited[neighbor] = true;
@@ -401,7 +410,7 @@ void GoBoard::set_from_array(const int8_t* board_data, int8_t to_play) {
     for (int i = 0; i < size_ * size_; ++i) {
         board_[i] = board_data[i];
         if (board_[i] != EMPTY) {
-            current_hash_ ^= zobrist_[i][board_[i]];
+            current_hash_ ^= tables_->zobrist[i][board_[i]];
         }
     }
     seen_hashes_.clear();
