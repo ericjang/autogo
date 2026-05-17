@@ -23,6 +23,10 @@ dependencies = [
     "grpcio>=1.60.0",
     "grpcio-tools>=1.60.0",
     "scikit-learn>=1.7.2",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.9",
 ]
 
 [build-system]
